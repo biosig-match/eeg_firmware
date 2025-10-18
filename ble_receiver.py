@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """
-ADS1299 BLE Data Receiver with Real-time Visualization
+ADS1299 BLE Data Receiver with Real-time Visualization and CSV Logging.
 Communicates with the NUS-like BLE service defined in main.cpp.
 - Handles two packet types: Device Configuration and Chunked Data.
 - Provides controls to start/stop data streaming.
 - Updates plot labels based on received configuration.
+- Saves all streaming data to a timestamped CSV file.
 """
 
 import sys
 import struct
 import asyncio
+import csv
+from datetime import datetime
 from collections import deque
 import numpy as np
 from bleak import BleakClient, BleakScanner
@@ -31,32 +34,52 @@ CMD_STOP_STREAMING = b'\x5B'
 PKT_TYPE_DATA_CHUNK = 0x66
 PKT_TYPE_DEVICE_CFG = 0xDD
 
+# ========= Packet Sizes (must match main.cpp) =========
+DEVICE_CONFIG_PACKET_SIZE = 88
+CHUNKED_SAMPLE_PACKET_SIZE = 504
+
 # Display buffer size (time window)
 BUFFER_SIZE = 750  # 250 SPS * 3 seconds
 
 class BLEThread(QThread):
-    """Handles BLE communication in a separate thread."""
+    """
+    Handles BLE communication in a separate thread.
+    This class has been refactored to use a more robust asyncio event loop
+    management pattern (`run_forever`) and includes a buffer to handle
+    fragmented BLE packets.
+    """
     connection_status = pyqtSignal(str)
     config_received = pyqtSignal(dict)
     data_received = pyqtSignal(list)  # Emits a list of samples
 
     def __init__(self):
         super().__init__()
-        self.running = False
         self.client = None
         self.rx_char = None
         self.loop = None
+        self.main_task = None
+        self.is_running = False
+        self.rx_buffer = bytearray() # Buffer for fragmented packets
 
     def run(self):
-        """Main thread entry point."""
-        self.running = True
-        self.loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self.loop)
-        self.loop.run_until_complete(self.ble_main())
-        self.loop.close()
+        """
+        Main thread entry point.
+        Initializes and runs the asyncio event loop.
+        """
+        self.is_running = True
+        try:
+            self.loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self.loop)
+            self.main_task = self.loop.create_task(self.ble_main())
+            self.loop.run_forever()
+        finally:
+            if self.main_task and not self.main_task.done():
+                self.loop.run_until_complete(self.main_task)
+            self.loop.close()
 
     async def ble_main(self):
         """Main BLE connection and data reception logic."""
+        client = None
         try:
             self.connection_status.emit(f"Scanning for '{DEVICE_NAME}'...")
             device = await BleakScanner.find_device_by_name(DEVICE_NAME, timeout=10.0)
@@ -66,65 +89,92 @@ class BLEThread(QThread):
                 return
 
             self.connection_status.emit(f"Connecting to {device.name} ({device.address})...")
+            
+            client = BleakClient(device.address, timeout=20.0)
+            await client.connect()
+            self.client = client
+            
+            self.connection_status.emit(f"Connected to {device.name}.")
 
-            async with BleakClient(device.address) as client:
-                self.client = client
-                self.connection_status.emit(f"Connected to {device.name}.")
+            self.rx_char = client.services.get_characteristic(CHARACTERISTIC_UUID_RX)
+            if not self.rx_char:
+                self.connection_status.emit("RX Characteristic not found!")
+                return
 
-                # Find the RX characteristic for sending commands
-                self.rx_char = client.services.get_characteristic(CHARACTERISTIC_UUID_RX)
-                if not self.rx_char:
-                    self.connection_status.emit("RX Characteristic not found!")
-                    return
+            await client.start_notify(CHARACTERISTIC_UUID_TX, self.notification_handler)
+            self.connection_status.emit("Ready. Waiting for streaming command.")
 
-                await client.start_notify(CHARACTERISTIC_UUID_TX, self.notification_handler)
-                self.connection_status.emit("Ready. Waiting for streaming command.")
+            while self.is_running:
+                await asyncio.sleep(0.1)
 
-                while self.running:
-                    await asyncio.sleep(0.1)
-
-                await client.stop_notify(CHARACTERISTIC_UUID_TX)
-                self.connection_status.emit("Disconnected.")
-
+        except asyncio.CancelledError:
+            self.connection_status.emit("BLE task was cancelled.")
         except Exception as e:
-            self.connection_status.emit(f"Error: {e}")
+            self.connection_status.emit(f"An error occurred: {e}")
         finally:
+            if client and client.is_connected:
+                await client.disconnect()
+            self.connection_status.emit("BLE connection closed.")
             self.client = None
             self.rx_char = None
 
+
     def notification_handler(self, sender, data: bytearray):
-        """Callback for incoming BLE notifications."""
+        """
+        Callback for incoming BLE notifications.
+        This now buffers and reassembles fragmented packets.
+        """
         if not data:
             return
+        
+        self.rx_buffer.extend(data) # Add new data to the buffer
 
-        packet_type = data[0]
+        # Process buffer as long as it might contain complete packets
+        while True:
+            if len(self.rx_buffer) < 1:
+                break # Buffer is empty
 
-        if packet_type == PKT_TYPE_DEVICE_CFG:
-            self.parse_config_packet(data)
-        elif packet_type == PKT_TYPE_DATA_CHUNK:
-            self.parse_data_chunk_packet(data)
-        else:
-            print(f"Warning: Received unknown packet type: 0x{packet_type:02X}")
+            packet_type = self.rx_buffer[0]
+            
+            expected_len = 0
+            if packet_type == PKT_TYPE_DEVICE_CFG:
+                expected_len = DEVICE_CONFIG_PACKET_SIZE
+            elif packet_type == PKT_TYPE_DATA_CHUNK:
+                expected_len = CHUNKED_SAMPLE_PACKET_SIZE
+            else:
+                print(f"Warning: Unknown packet type 0x{packet_type:02X} in buffer. Clearing buffer.")
+                self.rx_buffer.clear()
+                break
+            
+            # Check if we have a full packet in the buffer
+            if len(self.rx_buffer) >= expected_len:
+                # Extract the full packet
+                packet_data = self.rx_buffer[:expected_len]
+                # Remove the extracted packet from the buffer
+                self.rx_buffer = self.rx_buffer[expected_len:]
+
+                # Parse the complete packet
+                if packet_type == PKT_TYPE_DEVICE_CFG:
+                    self.parse_config_packet(packet_data)
+                elif packet_type == PKT_TYPE_DATA_CHUNK:
+                    self.parse_data_chunk_packet(packet_data)
+            else:
+                # Not enough data for a full packet, wait for more
+                break
+
 
     def parse_config_packet(self, data: bytearray):
         """Parses the DeviceConfigPacket (0xDD)."""
-        if len(data) < 88: # Size of DeviceConfigPacket
+        if len(data) < DEVICE_CONFIG_PACKET_SIZE:
             print(f"Warning: Config packet is too short ({len(data)} bytes)")
             return
         
-        # struct DeviceConfigPacket format: <B B 6x (8s B B)*8
-        # Unpack header
         _, num_channels = struct.unpack('<BB', data[0:2])
-        
         config = {'num_channels': num_channels, 'electrodes': []}
-        
-        # Unpack electrode configs
-        offset = 8 # Start of configs array
-        for i in range(8):
-            # Each ElectrodeConfig is 10 bytes: char[8], uint8_t, uint8_t
+        offset = 8 # packet_type(1), num_channels(1), reserved(6)
+        for i in range(8): # CH_MAX is 8
             chunk = data[offset + i*10 : offset + (i+1)*10]
             name_bytes, type_val, _ = struct.unpack('<8sBB', chunk)
-            # Decode C-style null-terminated string
             name = name_bytes.partition(b'\0')[0].decode('utf-8', 'ignore')
             config['electrodes'].append({'name': name, 'type': type_val})
         
@@ -133,29 +183,26 @@ class BLEThread(QThread):
 
     def parse_data_chunk_packet(self, data: bytearray):
         """Parses the ChunkedSamplePacket (0x66)."""
-        # Header: packet_type (1), start_index (2), num_samples (1)
         if len(data) < 4:
             print("Warning: Data chunk packet is too short for header.")
             return
-
         _, start_index, num_samples = struct.unpack('<B H B', data[0:4])
         
-        # Each SampleData is 20 bytes: int16_t[8], uint8_t, uint8_t[3]
-        expected_size = 4 + num_samples * 20
+        expected_size = 4 + num_samples * 20 # 20 bytes per SampleData
         if len(data) != expected_size:
             print(f"Warning: Data chunk size mismatch. Expected {expected_size}, got {len(data)}.")
             return
 
         samples_list = []
         offset = 4
-        for _ in range(num_samples):
+        for i in range(num_samples):
             sample_chunk = data[offset : offset + 20]
-            # '<' for little-endian, '8h' for 8 int16, 'B' for trigger, '3x' for 3 reserved bytes
+            # '<8hB3x' = 8 signed shorts (16 bytes), 1 unsigned byte, 3 padding bytes
             unpacked_data = struct.unpack('<8hB3x', sample_chunk)
-            
             sample = {
                 'signals': list(unpacked_data[0:8]),
-                'trigger': unpacked_data[8]
+                'trigger': unpacked_data[8],
+                'sample_index': start_index + i
             }
             samples_list.append(sample)
             offset += 20
@@ -163,7 +210,7 @@ class BLEThread(QThread):
         self.data_received.emit(samples_list)
 
     def _send_command(self, command: bytes):
-        if self.client and self.rx_char and self.client.is_connected:
+        if self.client and self.rx_char and self.client.is_connected and self.loop:
             asyncio.run_coroutine_threadsafe(
                 self.client.write_gatt_char(self.rx_char, command, response=False),
                 self.loop
@@ -180,8 +227,17 @@ class BLEThread(QThread):
         self._send_command(CMD_STOP_STREAMING)
 
     def stop(self):
-        """Stops the thread."""
-        self.running = False
+        """Stops the thread by safely stopping the asyncio event loop."""
+        self.is_running = False
+        if self.loop and self.loop.is_running():
+            self.loop.call_soon_threadsafe(self.loop.stop)
+
+
+# =============================================================================
+# MainWindow and other parts of the script remain unchanged.
+# Just ensure this modified BLEThread class is used.
+# =============================================================================
+
 
 class MainWindow(QMainWindow):
     """Main application window."""
@@ -203,6 +259,16 @@ class MainWindow(QMainWindow):
 
         self.setup_ui()
         self.is_streaming = False
+        
+        self.csv_file = None
+        self.csv_writer = None
+        self.csv_header_written = False
+
+        # Timeout timer to check for the first packet after starting stream
+        self.first_packet_timer = QTimer(self)
+        self.first_packet_timer.setSingleShot(True)
+        self.first_packet_timer.timeout.connect(self.check_first_packet_timeout)
+        self.first_packet_received = False
 
     def setup_ui(self):
         """Set up all UI elements."""
@@ -210,11 +276,10 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
 
-        # --- Top Control Panel ---
         control_panel = QWidget()
         control_layout = QHBoxLayout(control_panel)
         self.status_label = QLabel("Status: Not connected")
-        self.info_label = QLabel("Trigger: -")
+        self.info_label = QLabel("Trigger: - | File: -")
         self.connect_btn = QPushButton("Connect")
         self.start_btn = QPushButton("Start Streaming")
         self.stop_btn = QPushButton("Stop Streaming")
@@ -234,7 +299,6 @@ class MainWindow(QMainWindow):
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(False)
 
-        # --- Plots ---
         self.plots = []
         self.curves = []
         pg.setConfigOptions(antialias=True)
@@ -252,18 +316,18 @@ class MainWindow(QMainWindow):
             
             self.plots.append(plot_widget)
             self.curves.append(curve)
-            plot_grid.addWidget(plot_widget, i // 2, i % 2) # 2 columns of plots
+            plot_grid.addWidget(plot_widget, i // 2, i % 2)
 
         self.update_timer = QTimer()
         self.update_timer.timeout.connect(self.update_plots)
-        self.update_timer.start(33)  # ~30 FPS
+        self.update_timer.start(33)
 
     def toggle_connection(self):
         if not self.ble_thread.isRunning():
             self.connect_btn.setText("Disconnect")
             self.ble_thread.start()
         else:
-            self.stop_streaming() # Ensure streaming is stopped before disconnect
+            self.stop_streaming()
             self.ble_thread.stop()
             self.ble_thread.wait()
             self.connect_btn.setText("Connect")
@@ -271,54 +335,102 @@ class MainWindow(QMainWindow):
 
     def start_streaming(self):
         if self.ble_thread.isRunning() and not self.is_streaming:
-            # Clear buffers on start
             for buf in self.data_buffers:
                 buf.clear()
             self.time_buffer.clear()
             self.sample_count = 0
             
+            filename = f"eeg_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            try:
+                self.csv_file = open(filename, 'w', newline='', encoding='utf-8')
+                self.csv_writer = csv.writer(self.csv_file)
+                self.csv_header_written = False
+                print(f"Opened CSV file for logging: {filename}")
+                self.info_label.setText(f"Trigger: - | File: {filename}")
+            except Exception as e:
+                print(f"Error opening CSV file: {e}")
+                self.status_label.setText("Status: Error creating log file!")
+                return
+            
+            self.status_label.setText("Status: Sending start command...")
+            self.first_packet_received = False
+            self.first_packet_timer.start(3000) # 3-second timeout
+
             self.ble_thread.start_streaming()
             self.is_streaming = True
             self.start_btn.setEnabled(False)
             self.stop_btn.setEnabled(True)
-            self.status_label.setText("Status: Streaming...")
 
     def stop_streaming(self):
-        if self.ble_thread.isRunning() and self.is_streaming:
-            self.ble_thread.stop_streaming()
+        if self.is_streaming:
+            if self.ble_thread.isRunning():
+                self.ble_thread.stop_streaming()
+            
             self.is_streaming = False
             self.start_btn.setEnabled(True)
             self.stop_btn.setEnabled(False)
             self.status_label.setText("Status: Connected. Stream stopped.")
+
+            if self.csv_file:
+                self.csv_file.close()
+                self.csv_file = None
+                self.csv_writer = None
+                print("CSV file closed.")
+                self.info_label.setText("Trigger: - | File: - (closed)")
 
     def on_connection_status(self, status: str):
         self.status_label.setText(f"Status: {status}")
         is_connected = "Connected" in status or "Ready" in status or "Streaming" in status
         self.start_btn.setEnabled(is_connected)
         self.stop_btn.setEnabled(self.is_streaming and is_connected)
-        if "Disconnected" in status or "Error" in status or "not found" in status:
-            self.is_streaming = False
+        if "Disconnected" in status or "Error" in status or "not found" in status or "closed" in status:
+            if self.is_streaming:
+                self.stop_streaming()
             self.start_btn.setEnabled(False)
             self.stop_btn.setEnabled(False)
             self.connect_btn.setText("Connect")
 
 
     def on_config_received(self, config: dict):
+        self.first_packet_timer.stop()
+        if not self.first_packet_received:
+            self.first_packet_received = True
+            self.status_label.setText("Status: Streaming...")
+
         self.num_channels = config.get('num_channels', 8)
         electrodes = config.get('electrodes', [])
         print(f"Applying new configuration. Channels: {self.num_channels}")
+
+        if self.csv_writer and not self.csv_header_written:
+            ch_names = [e['name'] if e['name'] else f'CH{i+1}' for i, e in enumerate(electrodes)]
+            header = ['timestamp', 'sample_index'] + ch_names[:self.num_channels] + ['trigger']
+            self.csv_writer.writerow(header)
+            self.csv_header_written = True
+            print(f"CSV header written: {header}")
+
         for i in range(len(self.plots)):
             if i < len(electrodes) and i < self.num_channels:
                 label_name = electrodes[i]['name'] if electrodes[i]['name'] else f'CH{i+1}'
                 self.plots[i].setLabel('left', label_name, units='LSB')
                 self.plots[i].setVisible(True)
             else:
-                # Hide plots for unused channels
                 self.plots[i].setVisible(False)
     
     def on_data_received(self, samples_list: list):
         """Process a list of incoming samples."""
+        if not self.first_packet_received:
+            self.first_packet_timer.stop()
+            self.first_packet_received = True
+            self.status_label.setText("Status: Streaming...")
+
         last_trigger = 0
+        
+        if self.csv_writer and self.csv_header_written:
+            for sample in samples_list:
+                timestamp = datetime.now().isoformat()
+                row = [timestamp, sample['sample_index']] + sample['signals'][:self.num_channels] + [sample['trigger']]
+                self.csv_writer.writerow(row)
+
         for sample in samples_list:
             self.time_buffer.append(self.sample_count)
             self.sample_count += 1
@@ -327,7 +439,8 @@ class MainWindow(QMainWindow):
             last_trigger = sample['trigger']
         
         trigger_bits = format(last_trigger, '04b')
-        self.info_label.setText(f"Trigger: {trigger_bits} (0x{last_trigger:X})")
+        current_file_text = self.info_label.text().split("|")[-1].strip()
+        self.info_label.setText(f"Trigger: {trigger_bits} | {current_file_text}")
         
     def update_plots(self):
         """Update graphs with new data from buffers."""
@@ -339,8 +452,15 @@ class MainWindow(QMainWindow):
             if self.data_buffers[i]:
                 self.curves[i].setData(x=time_array, y=np.array(self.data_buffers[i]))
 
+    def check_first_packet_timeout(self):
+        """Called by QTimer if no packets are received after starting stream."""
+        if self.is_streaming and not self.first_packet_received:
+            self.status_label.setText("Status: No response from device. Check firmware/hardware.")
+
     def closeEvent(self, event):
         """Handle window close event."""
+        if self.is_streaming:
+            self.stop_streaming()
         if self.ble_thread.isRunning():
             self.ble_thread.stop()
             self.ble_thread.wait()
