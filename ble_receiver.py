@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
 ADS1299 BLE Data Receiver with Real-time Visualization
-PyQt5を使用して8チャンネルのEEGデータをリアルタイム表示
+Communicates with the NUS-like BLE service defined in main.cpp.
+- Handles two packet types: Device Configuration and Chunked Data.
+- Provides controls to start/stop data streaming.
+- Updates plot labels based on received configuration.
 """
 
 import sys
@@ -10,238 +13,344 @@ import asyncio
 from collections import deque
 import numpy as np
 from bleak import BleakClient, BleakScanner
-from PyQt5.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, QWidget, QPushButton, QLabel
+from PyQt5.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, QWidget, QPushButton, QLabel, QGridLayout
 from PyQt5.QtCore import QThread, pyqtSignal, QTimer
 import pyqtgraph as pg
 
-# BLE UUID設定（main.cppと一致させる）
-SERVICE_UUID = "12345678-1234-1234-1234-123456789012"
-CHARACTERISTIC_UUID = "87654321-4321-4321-4321-210987654321"
-DEVICE_NAME = "ADS1299_EEG"
+# ========= BLE Settings (must match main.cpp) =========
+SERVICE_UUID = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+CHARACTERISTIC_UUID_TX = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"  # For receiving notifications
+CHARACTERISTIC_UUID_RX = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"  # For writing commands
+DEVICE_NAME = "ADS1299_EEG_NUS"
 
-# データバッファサイズ（表示する時間窓）
-BUFFER_SIZE = 500  # 250 SPS * 2秒分
+# ========= Control Commands (must match main.cpp) =========
+CMD_START_STREAMING = b'\xAA'
+CMD_STOP_STREAMING = b'\x5B'
 
+# ========= Packet Types (must match main.cpp) =========
+PKT_TYPE_DATA_CHUNK = 0x66
+PKT_TYPE_DEVICE_CFG = 0xDD
+
+# Display buffer size (time window)
+BUFFER_SIZE = 750  # 250 SPS * 3 seconds
 
 class BLEThread(QThread):
-    """BLE通信を別スレッドで実行"""
-    data_received = pyqtSignal(list, int, int)  # (channel_data, gpio, option)
+    """Handles BLE communication in a separate thread."""
     connection_status = pyqtSignal(str)
+    config_received = pyqtSignal(dict)
+    data_received = pyqtSignal(list)  # Emits a list of samples
 
     def __init__(self):
         super().__init__()
         self.running = False
         self.client = None
+        self.rx_char = None
+        self.loop = None
 
     def run(self):
-        """スレッドのメイン処理"""
+        """Main thread entry point."""
         self.running = True
-        asyncio.run(self.ble_main())
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        self.loop.run_until_complete(self.ble_main())
+        self.loop.close()
 
     async def ble_main(self):
-        """BLE接続とデータ受信のメイン処理"""
+        """Main BLE connection and data reception logic."""
         try:
-            # デバイスをスキャン
-            self.connection_status.emit("Scanning for devices...")
-            devices = await BleakScanner.discover(timeout=5.0)
+            self.connection_status.emit(f"Scanning for '{DEVICE_NAME}'...")
+            device = await BleakScanner.find_device_by_name(DEVICE_NAME, timeout=10.0)
 
-            target_device = None
-            for device in devices:
-                if device.name == DEVICE_NAME:
-                    target_device = device
-                    break
-
-            if not target_device:
-                self.connection_status.emit(f"Device '{DEVICE_NAME}' not found")
+            if not device:
+                self.connection_status.emit(f"Device '{DEVICE_NAME}' not found.")
                 return
 
-            self.connection_status.emit(f"Connecting to {target_device.name}...")
+            self.connection_status.emit(f"Connecting to {device.name} ({device.address})...")
 
-            # BLE接続
-            async with BleakClient(target_device.address) as client:
+            async with BleakClient(device.address) as client:
                 self.client = client
-                self.connection_status.emit(f"Connected to {target_device.name}")
+                self.connection_status.emit(f"Connected to {device.name}.")
 
-                # 通知を有効化
-                await client.start_notify(CHARACTERISTIC_UUID, self.notification_handler)
+                # Find the RX characteristic for sending commands
+                self.rx_char = client.services.get_characteristic(CHARACTERISTIC_UUID_RX)
+                if not self.rx_char:
+                    self.connection_status.emit("RX Characteristic not found!")
+                    return
 
-                # 接続を維持
+                await client.start_notify(CHARACTERISTIC_UUID_TX, self.notification_handler)
+                self.connection_status.emit("Ready. Waiting for streaming command.")
+
                 while self.running:
                     await asyncio.sleep(0.1)
 
-                await client.stop_notify(CHARACTERISTIC_UUID)
+                await client.stop_notify(CHARACTERISTIC_UUID_TX)
+                self.connection_status.emit("Disconnected.")
 
         except Exception as e:
-            self.connection_status.emit(f"Error: {str(e)}")
+            self.connection_status.emit(f"Error: {e}")
+        finally:
+            self.client = None
+            self.rx_char = None
 
     def notification_handler(self, sender, data: bytearray):
-        """BLE通知受信時のコールバック"""
-        # 新フォーマット: 25サンプル × 18バイト = 450バイト
-        expected_size = 25 * 18
-        if len(data) != expected_size:
-            print(f"Warning: Expected {expected_size} bytes, got {len(data)}")
+        """Callback for incoming BLE notifications."""
+        if not data:
             return
 
-        # 25サンプル分のデータをパース
-        for sample_idx in range(25):
-            offset = sample_idx * 18
+        packet_type = data[0]
 
-            # 各サンプルの18バイトをパース
-            sample_data = data[offset:offset+18]
+        if packet_type == PKT_TYPE_DEVICE_CFG:
+            self.parse_config_packet(data)
+        elif packet_type == PKT_TYPE_DATA_CHUNK:
+            self.parse_data_chunk_packet(data)
+        else:
+            print(f"Warning: Received unknown packet type: 0x{packet_type:02X}")
 
-            # 8チャンネルのデータ
-            channel_data = []
-            for i in range(8):
-                # 16ビット符号付き整数（ビッグエンディアン）
-                value = struct.unpack('>h', sample_data[i*2:(i*2)+2])[0]
-                channel_data.append(value)
+    def parse_config_packet(self, data: bytearray):
+        """Parses the DeviceConfigPacket (0xDD)."""
+        if len(data) < 88: # Size of DeviceConfigPacket
+            print(f"Warning: Config packet is too short ({len(data)} bytes)")
+            return
+        
+        # struct DeviceConfigPacket format: <B B 6x (8s B B)*8
+        # Unpack header
+        _, num_channels = struct.unpack('<BB', data[0:2])
+        
+        config = {'num_channels': num_channels, 'electrodes': []}
+        
+        # Unpack electrode configs
+        offset = 8 # Start of configs array
+        for i in range(8):
+            # Each ElectrodeConfig is 10 bytes: char[8], uint8_t, uint8_t
+            chunk = data[offset + i*10 : offset + (i+1)*10]
+            name_bytes, type_val, _ = struct.unpack('<8sBB', chunk)
+            # Decode C-style null-terminated string
+            name = name_bytes.partition(b'\0')[0].decode('utf-8', 'ignore')
+            config['electrodes'].append({'name': name, 'type': type_val})
+        
+        print(f"Received device config: {num_channels} channels.")
+        self.config_received.emit(config)
 
-            # GPIO情報（バイト16の上位4ビット）
-            gpio = (sample_data[16] >> 4) & 0x0F
+    def parse_data_chunk_packet(self, data: bytearray):
+        """Parses the ChunkedSamplePacket (0x66)."""
+        # Header: packet_type (1), start_index (2), num_samples (1)
+        if len(data) < 4:
+            print("Warning: Data chunk packet is too short for header.")
+            return
 
-            # オプション情報（バイト17）
-            option = sample_data[17]
+        _, start_index, num_samples = struct.unpack('<B H B', data[0:4])
+        
+        # Each SampleData is 20 bytes: int16_t[8], uint8_t, uint8_t[3]
+        expected_size = 4 + num_samples * 20
+        if len(data) != expected_size:
+            print(f"Warning: Data chunk size mismatch. Expected {expected_size}, got {len(data)}.")
+            return
 
-            # シグナルを発行（各サンプルごとに）
-            self.data_received.emit(channel_data, gpio, option)
+        samples_list = []
+        offset = 4
+        for _ in range(num_samples):
+            sample_chunk = data[offset : offset + 20]
+            # '<' for little-endian, '8h' for 8 int16, 'B' for trigger, '3x' for 3 reserved bytes
+            unpacked_data = struct.unpack('<8hB3x', sample_chunk)
+            
+            sample = {
+                'signals': list(unpacked_data[0:8]),
+                'trigger': unpacked_data[8]
+            }
+            samples_list.append(sample)
+            offset += 20
+        
+        self.data_received.emit(samples_list)
+
+    def _send_command(self, command: bytes):
+        if self.client and self.rx_char and self.client.is_connected:
+            asyncio.run_coroutine_threadsafe(
+                self.client.write_gatt_char(self.rx_char, command, response=False),
+                self.loop
+            )
+        else:
+            self.connection_status.emit("Not connected, cannot send command.")
+
+    def start_streaming(self):
+        print("Sending START_STREAMING command...")
+        self._send_command(CMD_START_STREAMING)
+
+    def stop_streaming(self):
+        print("Sending STOP_STREAMING command...")
+        self._send_command(CMD_STOP_STREAMING)
 
     def stop(self):
-        """スレッドを停止"""
+        """Stops the thread."""
         self.running = False
 
-
 class MainWindow(QMainWindow):
-    """メインウィンドウ"""
+    """Main application window."""
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle("ADS1299 EEG Real-time Monitor")
-        self.setGeometry(100, 100, 1200, 800)
+        self.setGeometry(100, 100, 1200, 900)
 
-        # データバッファ（8チャンネル分）
-        self.data_buffers = [deque(maxlen=BUFFER_SIZE) for _ in range(8)]
+        self.num_channels = 8
+        self.data_buffers = [deque(maxlen=BUFFER_SIZE) for _ in range(self.num_channels)]
         self.time_buffer = deque(maxlen=BUFFER_SIZE)
         self.sample_count = 0
 
-        # BLEスレッド
         self.ble_thread = BLEThread()
-        self.ble_thread.data_received.connect(self.on_data_received)
         self.ble_thread.connection_status.connect(self.on_connection_status)
+        self.ble_thread.config_received.connect(self.on_config_received)
+        self.ble_thread.data_received.connect(self.on_data_received)
 
-        # UI構築
         self.setup_ui()
+        self.is_streaming = False
 
     def setup_ui(self):
-        """UI要素の配置"""
+        """Set up all UI elements."""
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
+        main_layout = QVBoxLayout(central_widget)
 
-        layout = QVBoxLayout()
-        central_widget.setLayout(layout)
-
-        # 接続状態ラベル
+        # --- Top Control Panel ---
+        control_panel = QWidget()
+        control_layout = QHBoxLayout(control_panel)
         self.status_label = QLabel("Status: Not connected")
-        layout.addWidget(self.status_label)
-
-        # GPIO/Option情報ラベル
-        self.info_label = QLabel("GPIO: ---- | Option: --")
-        layout.addWidget(self.info_label)
-
-        # 接続ボタン
-        btn_layout = QHBoxLayout()
+        self.info_label = QLabel("Trigger: -")
         self.connect_btn = QPushButton("Connect")
-        self.connect_btn.clicked.connect(self.start_connection)
-        self.disconnect_btn = QPushButton("Disconnect")
-        self.disconnect_btn.clicked.connect(self.stop_connection)
-        self.disconnect_btn.setEnabled(False)
+        self.start_btn = QPushButton("Start Streaming")
+        self.stop_btn = QPushButton("Stop Streaming")
 
-        btn_layout.addWidget(self.connect_btn)
-        btn_layout.addWidget(self.disconnect_btn)
-        layout.addLayout(btn_layout)
+        control_layout.addWidget(self.connect_btn)
+        control_layout.addWidget(self.start_btn)
+        control_layout.addWidget(self.stop_btn)
+        control_layout.addStretch(1)
+        control_layout.addWidget(self.status_label)
+        control_layout.addWidget(self.info_label)
+        main_layout.addWidget(control_panel)
 
-        # グラフウィジェット（8チャンネル分）
+        self.connect_btn.clicked.connect(self.toggle_connection)
+        self.start_btn.clicked.connect(self.start_streaming)
+        self.stop_btn.clicked.connect(self.stop_streaming)
+
+        self.start_btn.setEnabled(False)
+        self.stop_btn.setEnabled(False)
+
+        # --- Plots ---
         self.plots = []
         self.curves = []
-
-        # PyQtGraphの設定
         pg.setConfigOptions(antialias=True)
+        
+        plot_grid = QGridLayout()
+        main_layout.addLayout(plot_grid)
 
-        for i in range(8):
+        for i in range(self.num_channels):
             plot_widget = pg.PlotWidget()
             plot_widget.setLabel('left', f'CH{i+1}', units='LSB')
             plot_widget.setLabel('bottom', 'Samples')
             plot_widget.setYRange(-32768, 32767)
             plot_widget.showGrid(x=True, y=True)
-
             curve = plot_widget.plot(pen=pg.mkPen(color=(0, 150, 255), width=1))
-
+            
             self.plots.append(plot_widget)
             self.curves.append(curve)
-            layout.addWidget(plot_widget)
+            plot_grid.addWidget(plot_widget, i // 2, i % 2) # 2 columns of plots
 
-        # グラフ更新タイマー（60 FPS）
         self.update_timer = QTimer()
         self.update_timer.timeout.connect(self.update_plots)
-        self.update_timer.start(16)  # 約60 FPS
+        self.update_timer.start(33)  # ~30 FPS
 
-    def start_connection(self):
-        """BLE接続開始"""
-        self.connect_btn.setEnabled(False)
-        self.disconnect_btn.setEnabled(True)
-        self.ble_thread.start()
+    def toggle_connection(self):
+        if not self.ble_thread.isRunning():
+            self.connect_btn.setText("Disconnect")
+            self.ble_thread.start()
+        else:
+            self.stop_streaming() # Ensure streaming is stopped before disconnect
+            self.ble_thread.stop()
+            self.ble_thread.wait()
+            self.connect_btn.setText("Connect")
+            self.on_connection_status("Disconnected by user.")
 
-    def stop_connection(self):
-        """BLE接続終了"""
-        self.ble_thread.stop()
-        self.ble_thread.wait()
-        self.connect_btn.setEnabled(True)
-        self.disconnect_btn.setEnabled(False)
-        self.status_label.setText("Status: Disconnected")
+    def start_streaming(self):
+        if self.ble_thread.isRunning() and not self.is_streaming:
+            # Clear buffers on start
+            for buf in self.data_buffers:
+                buf.clear()
+            self.time_buffer.clear()
+            self.sample_count = 0
+            
+            self.ble_thread.start_streaming()
+            self.is_streaming = True
+            self.start_btn.setEnabled(False)
+            self.stop_btn.setEnabled(True)
+            self.status_label.setText("Status: Streaming...")
+
+    def stop_streaming(self):
+        if self.ble_thread.isRunning() and self.is_streaming:
+            self.ble_thread.stop_streaming()
+            self.is_streaming = False
+            self.start_btn.setEnabled(True)
+            self.stop_btn.setEnabled(False)
+            self.status_label.setText("Status: Connected. Stream stopped.")
 
     def on_connection_status(self, status: str):
-        """接続状態更新"""
         self.status_label.setText(f"Status: {status}")
+        is_connected = "Connected" in status or "Ready" in status or "Streaming" in status
+        self.start_btn.setEnabled(is_connected)
+        self.stop_btn.setEnabled(self.is_streaming and is_connected)
+        if "Disconnected" in status or "Error" in status or "not found" in status:
+            self.is_streaming = False
+            self.start_btn.setEnabled(False)
+            self.stop_btn.setEnabled(False)
+            self.connect_btn.setText("Connect")
 
-    def on_data_received(self, channel_data: list, gpio: int, option: int):
-        """データ受信時の処理"""
-        # タイムスタンプ
-        self.time_buffer.append(self.sample_count)
-        self.sample_count += 1
 
-        # 各チャンネルのデータをバッファに追加
-        for i in range(8):
-            self.data_buffers[i].append(channel_data[i])
-
-        # GPIO/Option情報を表示（ビット表現）
-        gpio_bits = format(gpio, '04b')
-        option_bits = format(option, '08b')
-        self.info_label.setText(f"GPIO: {gpio_bits} (0x{gpio:X}) | Option: {option_bits} (0x{option:02X})")
-
+    def on_config_received(self, config: dict):
+        self.num_channels = config.get('num_channels', 8)
+        electrodes = config.get('electrodes', [])
+        print(f"Applying new configuration. Channels: {self.num_channels}")
+        for i in range(len(self.plots)):
+            if i < len(electrodes) and i < self.num_channels:
+                label_name = electrodes[i]['name'] if electrodes[i]['name'] else f'CH{i+1}'
+                self.plots[i].setLabel('left', label_name, units='LSB')
+                self.plots[i].setVisible(True)
+            else:
+                # Hide plots for unused channels
+                self.plots[i].setVisible(False)
+    
+    def on_data_received(self, samples_list: list):
+        """Process a list of incoming samples."""
+        last_trigger = 0
+        for sample in samples_list:
+            self.time_buffer.append(self.sample_count)
+            self.sample_count += 1
+            for i in range(self.num_channels):
+                self.data_buffers[i].append(sample['signals'][i])
+            last_trigger = sample['trigger']
+        
+        trigger_bits = format(last_trigger, '04b')
+        self.info_label.setText(f"Trigger: {trigger_bits} (0x{last_trigger:X})")
+        
     def update_plots(self):
-        """グラフ更新"""
-        if len(self.time_buffer) == 0:
+        """Update graphs with new data from buffers."""
+        if not self.time_buffer:
             return
 
         time_array = np.array(self.time_buffer)
-
-        for i in range(8):
-            if len(self.data_buffers[i]) > 0:
-                data_array = np.array(self.data_buffers[i])
-                self.curves[i].setData(time_array, data_array)
+        for i in range(self.num_channels):
+            if self.data_buffers[i]:
+                self.curves[i].setData(x=time_array, y=np.array(self.data_buffers[i]))
 
     def closeEvent(self, event):
-        """ウィンドウを閉じる時の処理"""
-        self.ble_thread.stop()
-        self.ble_thread.wait()
+        """Handle window close event."""
+        if self.ble_thread.isRunning():
+            self.ble_thread.stop()
+            self.ble_thread.wait()
         event.accept()
-
 
 def main():
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()
     sys.exit(app.exec_())
-
 
 if __name__ == "__main__":
     main()
