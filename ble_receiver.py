@@ -82,18 +82,42 @@ class BLEThread(QThread):
         client = None
         try:
             self.connection_status.emit(f"Scanning for '{DEVICE_NAME}'...")
-            device = await BleakScanner.find_device_by_name(DEVICE_NAME, timeout=10.0)
+
+            # macOS fix: Use discover() instead of find_device_by_name for better reliability
+            devices = await BleakScanner.discover(timeout=15.0)
+            device = None
+            for d in devices:
+                if d.name == DEVICE_NAME:
+                    device = d
+                    break
 
             if not device:
                 self.connection_status.emit(f"Device '{DEVICE_NAME}' not found.")
                 return
 
             self.connection_status.emit(f"Connecting to {device.name} ({device.address})...")
-            
-            client = BleakClient(device.address, timeout=20.0)
-            await client.connect()
+
+            # macOS fix: Increase timeout and add connection retry logic
+            client = BleakClient(device.address, timeout=30.0)
+
+            # Add retry logic for connection
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    await client.connect()
+                    break
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        self.connection_status.emit(f"Connection attempt {attempt + 1} failed, retrying...")
+                        await asyncio.sleep(2)
+                    else:
+                        raise
+
             self.client = client
-            
+
+            # macOS fix: Add small delay after connection
+            await asyncio.sleep(0.5)
+
             self.connection_status.emit(f"Connected to {device.name}.")
 
             self.rx_char = client.services.get_characteristic(CHARACTERISTIC_UUID_RX)
@@ -126,7 +150,8 @@ class BLEThread(QThread):
         """
         if not data:
             return
-        
+
+        print(f"DEBUG: Received {len(data)} bytes from BLE: {data[:20].hex()}...")
         self.rx_buffer.extend(data) # Add new data to the buffer
 
         # Process buffer as long as it might contain complete packets
@@ -211,11 +236,21 @@ class BLEThread(QThread):
 
     def _send_command(self, command: bytes):
         if self.client and self.rx_char and self.client.is_connected and self.loop:
-            asyncio.run_coroutine_threadsafe(
-                self.client.write_gatt_char(self.rx_char, command, response=False),
-                self.loop
-            )
+            print(f"DEBUG: Sending command: {command.hex()} to characteristic {self.rx_char.uuid}")
+            try:
+                future = asyncio.run_coroutine_threadsafe(
+                    self.client.write_gatt_char(self.rx_char, command, response=True),
+                    self.loop
+                )
+                # Wait for the write to complete with timeout
+                future.result(timeout=5.0)
+                print(f"DEBUG: Command sent successfully")
+                self.connection_status.emit("Command sent successfully.")
+            except Exception as e:
+                print(f"DEBUG: Failed to send command: {e}")
+                self.connection_status.emit(f"Failed to send command: {e}")
         else:
+            print(f"DEBUG: Cannot send - client:{self.client is not None}, rx_char:{self.rx_char is not None}, connected:{self.client.is_connected if self.client else False}, loop:{self.loop is not None}")
             self.connection_status.emit("Not connected, cannot send command.")
 
     def start_streaming(self):
