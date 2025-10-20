@@ -6,6 +6,9 @@ Communicates with the NUS-like BLE service defined in main.cpp.
 - Provides controls to start/stop data streaming.
 - Updates plot labels based on received configuration.
 - Saves all streaming data to a timestamped CSV file.
+- Converts LSB data to microvolts (uV).
+- Displays plots with autorange.
+- Applies a 50Hz notch filter and a 0.5-30Hz bandpass filter.
 """
 
 import sys
@@ -15,6 +18,7 @@ import csv
 from datetime import datetime
 from collections import deque
 import numpy as np
+from scipy import signal
 from bleak import BleakClient, BleakScanner
 from PyQt5.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, QWidget, QPushButton, QLabel, QGridLayout
 from PyQt5.QtCore import QThread, pyqtSignal, QTimer
@@ -38,8 +42,19 @@ PKT_TYPE_DEVICE_CFG = 0xDD
 DEVICE_CONFIG_PACKET_SIZE = 88
 CHUNKED_SAMPLE_PACKET_SIZE = 504
 
-# Display buffer size (time window)
+# Display buffer size (time window) and sampling rate
 BUFFER_SIZE = 750  # 250 SPS * 3 seconds
+SAMPLING_RATE = 250 # Samples per second
+
+# --- ▼▼▼ μV変換のための定数 ▼▼▼ ---
+V_REF = 4.5  # ADS1299のリファレンス電圧 (通常は4.5V)
+# ★★★ ファームウェアでのPGAゲイン設定に合わせてこの値を変更してください ★★★
+PGA_GAIN = 24.0
+# ★★★ 注意: ファームウェアから送られるデータが16ビット整数('<8h..')であるため、
+# 16ビットの分解能で計算します。もしファームウェアが24ビットデータを
+# 送るように変更された場合は、(2**23 - 1) に変更してください。
+LSB_TO_MICROVOLTS = (V_REF / PGA_GAIN / (2**15 - 1)) * 1_000_000
+# --- ▲▲▲ ---
 
 class BLEThread(QThread):
     """
@@ -233,12 +248,6 @@ class BLEThread(QThread):
             self.loop.call_soon_threadsafe(self.loop.stop)
 
 
-# =============================================================================
-# MainWindow and other parts of the script remain unchanged.
-# Just ensure this modified BLEThread class is used.
-# =============================================================================
-
-
 class MainWindow(QMainWindow):
     """Main application window."""
 
@@ -269,6 +278,25 @@ class MainWindow(QMainWindow):
         self.first_packet_timer.setSingleShot(True)
         self.first_packet_timer.timeout.connect(self.check_first_packet_timeout)
         self.first_packet_received = False
+        
+        # --- ▼▼▼ フィルタ設計 ▼▼▼ ---
+        self.fs = SAMPLING_RATE  # サンプリング周波数
+
+        # 50Hzノッチフィルタの設計
+        f0_notch = 50.0  # 除去したい周波数 (Hz)
+        Q_notch = 30.0   # クオリティファクタ
+        self.b_notch, self.a_notch = signal.iirnotch(f0_notch, Q_notch, self.fs)
+        self.notch_filter_states = [signal.lfilter_zi(self.b_notch, self.a_notch) for _ in range(self.num_channels)]
+        
+        # 0.5-30Hz バンドパスフィルタの設計 (2次バターワース)
+        nyquist = 0.5 * self.fs
+        low_cutoff = 0.5
+        high_cutoff = 30.0
+        low = low_cutoff / nyquist
+        high = high_cutoff / nyquist
+        self.b_band, self.a_band = signal.butter(2, [low, high], btype='band')
+        self.bandpass_filter_states = [signal.lfilter_zi(self.b_band, self.a_band) for _ in range(self.num_channels)]
+        # --- ▲▲▲ フィルタ設計ここまで ▲▲▲ ---
 
     def setup_ui(self):
         """Set up all UI elements."""
@@ -308,9 +336,9 @@ class MainWindow(QMainWindow):
 
         for i in range(self.num_channels):
             plot_widget = pg.PlotWidget()
-            plot_widget.setLabel('left', f'CH{i+1}', units='LSB')
+            plot_widget.setLabel('left', f'CH{i+1}', units='μV') 
             plot_widget.setLabel('bottom', 'Samples')
-            plot_widget.setYRange(-32768, 32767)
+            # YRangeの固定を削除し、オートレンジを有効化
             plot_widget.showGrid(x=True, y=True)
             curve = plot_widget.plot(pen=pg.mkPen(color=(0, 150, 255), width=1))
             
@@ -339,6 +367,11 @@ class MainWindow(QMainWindow):
                 buf.clear()
             self.time_buffer.clear()
             self.sample_count = 0
+            
+            # --- ▼▼▼ ストリーミング開始時に両方のフィルタ状態をリセット ▼▼▼ ---
+            self.notch_filter_states = [signal.lfilter_zi(self.b_notch, self.a_notch) for _ in range(self.num_channels)]
+            self.bandpass_filter_states = [signal.lfilter_zi(self.b_band, self.a_band) for _ in range(self.num_channels)]
+            # --- ▲▲▲ ---
             
             filename = f"eeg_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
             try:
@@ -403,7 +436,8 @@ class MainWindow(QMainWindow):
 
         if self.csv_writer and not self.csv_header_written:
             ch_names = [e['name'] if e['name'] else f'CH{i+1}' for i, e in enumerate(electrodes)]
-            header = ['timestamp', 'sample_index'] + ch_names[:self.num_channels] + ['trigger']
+            header_ch_names = [f"{name} (uV)" for name in ch_names[:self.num_channels]]
+            header = ['timestamp', 'sample_index'] + header_ch_names + ['trigger']
             self.csv_writer.writerow(header)
             self.csv_header_written = True
             print(f"CSV header written: {header}")
@@ -411,33 +445,64 @@ class MainWindow(QMainWindow):
         for i in range(len(self.plots)):
             if i < len(electrodes) and i < self.num_channels:
                 label_name = electrodes[i]['name'] if electrodes[i]['name'] else f'CH{i+1}'
-                self.plots[i].setLabel('left', label_name, units='LSB')
+                self.plots[i].setLabel('left', label_name, units='μV')
                 self.plots[i].setVisible(True)
             else:
                 self.plots[i].setVisible(False)
     
     def on_data_received(self, samples_list: list):
-        """Process a list of incoming samples."""
+        """Process a list of incoming samples with cascaded filters."""
         if not self.first_packet_received:
             self.first_packet_timer.stop()
             self.first_packet_received = True
             self.status_label.setText("Status: Streaming...")
+        
+        if not samples_list:
+            return
+
+        # --- ▼▼▼ フィルタリング処理 ▼▼▼ ---
+        # signals_by_channel の形状: (チャンネル数, 受信サンプル数)
+        signals_by_channel = np.array([s['signals'] for s in samples_list]).T
+        final_filtered_signals = np.zeros_like(signals_by_channel, dtype=float)
+
+        # 各チャンネルにフィルタをカスケード適用
+        for i in range(self.num_channels):
+            # Stage 1: 50Hzノッチフィルタ
+            notched_chunk, self.notch_filter_states[i] = signal.lfilter(
+                self.b_notch, self.a_notch, signals_by_channel[i, :], zi=self.notch_filter_states[i]
+            )
+            
+            # Stage 2: 0.5-30Hzバンドパスフィルタ
+            bandpassed_chunk, self.bandpass_filter_states[i] = signal.lfilter(
+                self.b_band, self.a_band, notched_chunk, zi=self.bandpass_filter_states[i]
+            )
+            
+            final_filtered_signals[i, :] = bandpassed_chunk
+
+        # CSV保存とプロットのために形状を戻す: (受信サンプル数, チャンネル数)
+        filtered_samples = final_filtered_signals.T
+        # --- ▲▲▲ フィルタリング処理ここまで ▲▲▲ ---
 
         last_trigger = 0
         
+        # CSV書き込み処理 (フィルタ適用後のデータを使用)
         if self.csv_writer and self.csv_header_written:
-            for sample in samples_list:
+            for idx, sample in enumerate(samples_list):
                 timestamp = datetime.now().isoformat()
-                row = [timestamp, sample['sample_index']] + sample['signals'][:self.num_channels] + [sample['trigger']]
+                signals_uV = [val * LSB_TO_MICROVOLTS for val in filtered_samples[idx][:self.num_channels]]
+                row = [timestamp, sample['sample_index']] + signals_uV + [sample['trigger']]
                 self.csv_writer.writerow(row)
 
-        for sample in samples_list:
+        # プロット用バッファの更新 (フィルタ適用後のデータを使用)
+        for idx, sample in enumerate(samples_list):
             self.time_buffer.append(self.sample_count)
             self.sample_count += 1
             for i in range(self.num_channels):
-                self.data_buffers[i].append(sample['signals'][i])
+                value_uV = filtered_samples[idx, i] * LSB_TO_MICROVOLTS
+                self.data_buffers[i].append(value_uV)
             last_trigger = sample['trigger']
         
+        # UI更新
         trigger_bits = format(last_trigger, '04b')
         current_file_text = self.info_label.text().split("|")[-1].strip()
         self.info_label.setText(f"Trigger: {trigger_bits} | {current_file_text}")
@@ -474,3 +539,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
