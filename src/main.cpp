@@ -279,8 +279,11 @@ bool readOneAds1299Sample(SampleData& outSample) {
     outSample.signals[ch] = 0;
   }
 
-  outSample.trigger_state = (gpio_status & 0x0F);
-  memset(outSample.reserved, 0, sizeof(outSample.reserved));
+  const uint8_t triggerNibble = (gpio_status & 0x0F);
+  outSample.trigger_state = triggerNibble;
+  outSample.reserved[0] = triggerNibble;
+  outSample.reserved[1] = triggerNibble ? 0xA5 : 0x00;
+  outSample.reserved[2] = 0x00;
   return true;
 }
 
@@ -332,4 +335,3 @@ void loop() {
     delay(10);
   }
 }
-
