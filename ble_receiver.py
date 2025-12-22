@@ -373,9 +373,16 @@ class MainWindow(QMainWindow):
             plot_widget = pg.PlotWidget()
             plot_widget.setLabel('left', f'CH{i+1}', units='μV') 
             plot_widget.setLabel('bottom', 'Samples')
-            # YRangeの固定を削除し、オートレンジを有効化
+            # Y軸は固定レンジ，X軸はオートレンジにする
             plot_widget.showGrid(x=True, y=True)
             curve = plot_widget.plot(pen=pg.mkPen(color=(0, 150, 255), width=1))
+
+            # ViewBoxで軸ごとにAutoRangeを制御する（disableAutoRange() は x,y 両方を止めてしまう）
+            vb = plot_widget.getPlotItem().getViewBox()
+            vb.enableAutoRange(axis=pg.ViewBox.XAxis, enable=True)
+            vb.enableAutoRange(axis=pg.ViewBox.YAxis, enable=False)
+            plot_widget.setYRange(-200, 200, padding=0)
+
             
             self.plots.append(plot_widget)
             self.curves.append(curve)
