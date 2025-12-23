@@ -15,6 +15,7 @@ import sys
 import struct
 import asyncio
 import csv
+import os
 from datetime import datetime
 from collections import deque
 import numpy as np
@@ -415,7 +416,11 @@ class MainWindow(QMainWindow):
             self.bandpass_filter_states = [signal.lfilter_zi(self.b_band, self.a_band) for _ in range(self.num_channels)]
             # --- ▲▲▲ ---
             
-            filename = f"eeg_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            save_dir = "eeg_data"
+            os.makedirs(save_dir, exist_ok=True)
+            timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+            filename = os.path.join(save_dir, f"eeg_data_{timestamp_str}.csv")
+
             try:
                 self.csv_file = open(filename, 'w', newline='', encoding='utf-8')
                 self.csv_writer = csv.writer(self.csv_file)
@@ -523,6 +528,12 @@ class MainWindow(QMainWindow):
 
         # CSV保存とプロットのために形状を戻す: (受信サンプル数, チャンネル数)
         filtered_samples = final_filtered_signals.T
+        
+        # CH1..CH3 から CH4 を差し引く (signals[0..2] -= signals[3])
+        if self.num_channels >= 4:
+            ref = filtered_samples[:, 3].copy()          # CH4
+            filtered_samples[:, 0:3] = filtered_samples[:, 0:3] - ref[:, None]
+
         # --- ▲▲▲ フィルタリング処理ここまで ▲▲▲ ---
 
         last_trigger = 0

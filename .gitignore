@@ -6,3 +6,5 @@
 .vscode/extensions.json
 .vscode/settings.json
 
+analysis_results/
+eeg_data/

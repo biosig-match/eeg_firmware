@@ -14,20 +14,56 @@ import pandas as pd
 import mne
 import numpy as np
 import matplotlib.pyplot as plt
+from scipy import signal
 import glob
 import os
 
-# --- 解析結果を保存するフォルダ名 ---
+# --- Results output directory ---
 RESULTS_DIR = "analysis_results"
 
-# --- 評価指標の計算に関する設定 ---
-SAMPLING_FREQ = 250  # Hz (デバイスの設定と一致させること)
+# --- Sampling frequency settings ---
+SAMPLING_FREQ = 250  # Hz (default)
 
-# LSBからマイクロボルトへの変換係数
-# ADS1299のデータシートより: V_ref=4.5V, Gain=24x.
-# スケール係数 = (V_ref / Gain) / (2^15)
-# 今回はuVで計算するため、1e6を乗算
+# LSB to microvolt conversion for ADS1299 (V_ref=4.5V, Gain=24x).
 SCALING_FACTOR = (4.5 / 24.0) / (2**15) * 1e6 # uV/LSB
+
+# PSD display scale (MNE default is dB)
+PSD_DB = True
+PSD_FMIN = 1.0
+PSD_FMAX = 60.0
+
+# DC offset removal (avoid PSD floor at ~0Hz)
+REMOVE_DC = True
+
+# Spike notch (for PSD display only)
+APPLY_SPIKE_NOTCH = True
+SPIKE_NOTCH_FREQS = [
+    3.0,
+    6.0, 16.0, 26.0, 36.0, 46.0, 56.0,
+    10.0, 20.0, 30.0, 40.0, 50.0, 60.0,
+    14.0, 24.0, 34.0, 44.0, 54.0,
+]
+SPIKE_NOTCH_Q = 30.0
+
+# Mains notch (for PSD display only)
+APPLY_MAINS_NOTCH = True
+MAINS_NOTCH_Q = 30.0
+
+# Bandpass (for PSD display only)
+APPLY_BANDPASS = True
+BANDPASS_LOW_HZ = 1.0
+BANDPASS_HIGH_HZ = 30.0
+
+# PSD output mode
+SAVE_RAW_PSD = True
+SAVE_CLEAN_PSD = True
+SAVE_STANDARD_PSD = True
+
+# Standard PSD settings (MNE-style defaults)
+STD_PSD_FMIN = 1.0
+STD_PSD_FMAX = 40.0
+STD_PSD_NFFT = 1024
+STD_PSD_OVERLAP = 512
 
 # 電源ノイズの周波数 (お住まいの地域に合わせて50または60に変更)
 POWER_LINE_FREQ = 50.0  # Hz (e.g., 50 for East Japan, 60 for West Japan)
@@ -43,12 +79,26 @@ POWER_LINE_RATIO_THRESHOLD = 5.0
 HIGH_FREQ_RATIO_THRESHOLD = 1.0
 
 
+def _load_bitbrain_info(directory: str, signal_id: str):
+    info_path = os.path.join(directory, "info.json")
+    if not os.path.exists(info_path):
+        return None
+    try:
+        import json
+        with open(info_path, "r", encoding="utf-8") as f:
+            info = json.load(f)
+    except Exception:
+        return None
+    for sig in info.get("signals", []):
+        if sig.get("id") == signal_id:
+            return sig
+    return None
+
+
 def analyze_eeg_data(filepath: str):
     """CSVファイルからEEGデータを読み込み、処理・分析・評価・保存を行う"""
     print(f"--- Analyzing EEG Data from: {filepath} ---")
 
-    # --- 結果保存用フォルダの作成 ---
-    os.makedirs(RESULTS_DIR, exist_ok=True)
     print(f"Results will be saved in the '{RESULTS_DIR}/' folder.")
 
     # 出力ファイル名のベースを作成 (e.g., "eeg_data_20231026_123000")
@@ -61,38 +111,177 @@ def analyze_eeg_data(filepath: str):
         return
 
     # --- 1. データ準備 ---
-    ch_names = [col for col in df.columns if col not in ['timestamp', 'sample_index', 'trigger']]
-    num_channels = len(ch_names)
-    print(f"Found {num_channels} channels: {ch_names}")
+    raw_ch_names = [col for col in df.columns if col not in ['timestamp', 'sample_index', 'trigger']]
+    num_channels = len(raw_ch_names)
+    print(f"Found {num_channels} channels: {raw_ch_names}")
 
-    # EEGデータを抽出し、LSBからマイクロボルト(uV)に変換
-    eeg_data_uv = df[ch_names].values.T * SCALING_FACTOR
-    # MNEはボルト(V)単位を要求するため、さらに1e-6を乗算
+    # Normalize channel names: "CH1 (LSB)" -> "CH1"
+    def normalize_ch_name(name: str) -> str:
+        if name.endswith(" (LSB)"):
+            return name[:-6]
+        if name.endswith(" (uV)"):
+            return name[:-5]
+        return name
+
+    # Unit detection (header / metadata)
+    has_lsb = any(name.endswith(" (LSB)") for name in raw_ch_names)
+    has_uv = any(name.endswith(" (uV)") for name in raw_ch_names)
+    sampling_freq = SAMPLING_FREQ
+    data_scale_to_uv = None
+    unit_label = "unknown"
+
+    ch_names = [normalize_ch_name(name) for name in raw_ch_names]
+    data_values = df[raw_ch_names].values.T
+
+    bitbrain_eeg = False
+    if not has_lsb and not has_uv:
+        base_name = os.path.splitext(os.path.basename(filepath))[0]
+        info = _load_bitbrain_info(os.path.dirname(filepath), base_name)
+        if info and info.get("signal_type") == "eeg":
+            bitbrain_eeg = True
+            sampling_freq = info.get("sampling_rate", SAMPLING_FREQ)
+            print(f"Detected bitbrain info.json: sampling_rate={sampling_freq} Hz")
+            median_abs = float(np.median(np.abs(data_values)))
+            if median_abs > 1000.0:
+                data_scale_to_uv = 1e-3  # nV -> uV
+                unit_label = "nV"
+            else:
+                data_scale_to_uv = 1.0
+                unit_label = "uV"
+        else:
+            data_scale_to_uv = 1.0
+            unit_label = "uV?"
+            print("Warning: Unknown unit. Assuming uV.")
+    elif has_uv and not has_lsb:
+        data_scale_to_uv = 1.0
+        unit_label = "uV"
+    elif has_lsb:
+        data_scale_to_uv = SCALING_FACTOR
+        unit_label = "LSB"
+    else:
+        data_scale_to_uv = 1.0
+        unit_label = "uV?"
+        print("Warning: Unknown unit. Assuming uV.")
+
+    eeg_data_uv = data_values * data_scale_to_uv
+    print(f"Detected unit: {unit_label} (scaled to uV).")
+    if unit_label == "LSB":
+        adc_max = (2**15 - 1)
+        adc_min = -2**15
+        near_max = np.any(data_values >= 0.95 * adc_max)
+        near_min = np.any(data_values <= 0.95 * adc_min)
+        if near_max or near_min:
+            print("Warning: ADC saturation detected (near 16-bit limits).")
+
+    if REMOVE_DC:
+        eeg_data_uv = eeg_data_uv - np.mean(eeg_data_uv, axis=1, keepdims=True)
+        print("DC offset removed (per channel).")
+
+    # PSD preprocessing for display
+    eeg_data_uv_psd = eeg_data_uv.copy()
+    if APPLY_SPIKE_NOTCH:
+        for f0 in SPIKE_NOTCH_FREQS:
+            b, a = signal.iirnotch(f0, SPIKE_NOTCH_Q, sampling_freq)
+            eeg_data_uv_psd = signal.filtfilt(b, a, eeg_data_uv_psd, axis=1)
+        print(f"Spike-notch applied for PSD: {SPIKE_NOTCH_FREQS} Hz")
+    if APPLY_MAINS_NOTCH:
+        b, a = signal.iirnotch(POWER_LINE_FREQ, MAINS_NOTCH_Q, sampling_freq)
+        eeg_data_uv_psd = signal.filtfilt(b, a, eeg_data_uv_psd, axis=1)
+        print(f"Mains-notch applied for PSD: {POWER_LINE_FREQ} Hz")
+    if APPLY_BANDPASS:
+        nyq = 0.5 * sampling_freq
+        low = BANDPASS_LOW_HZ / nyq
+        high = BANDPASS_HIGH_HZ / nyq
+        b, a = signal.butter(2, [low, high], btype='band')
+        eeg_data_uv_psd = signal.filtfilt(b, a, eeg_data_uv_psd, axis=1)
+        print(f"Bandpass applied for PSD: {BANDPASS_LOW_HZ}-{BANDPASS_HIGH_HZ} Hz")
+
     eeg_data_volts = eeg_data_uv * 1e-6
+    eeg_data_volts_psd = eeg_data_uv_psd * 1e-6
     
     # --- 2. MNE Rawオブジェクトの作成 ---
-    info = mne.create_info(ch_names=ch_names, sfreq=SAMPLING_FREQ, ch_types='eeg')
-    raw = mne.io.RawArray(eeg_data_volts, info)
+    info = mne.create_info(ch_names=ch_names, sfreq=sampling_freq, ch_types='eeg')
+    raw_quality = mne.io.RawArray(eeg_data_volts, info)
+    raw_psd = mne.io.RawArray(eeg_data_volts_psd, info)
     print("\n--- MNE Raw object created successfully ---")
-    print(raw)
+    print(raw_quality)
 
     # --- 3. PSDの計算、プロット、保存 ---
     print("\n--- Plotting and Saving Power Spectral Density (PSD) ---")
-    psd_fig = raw.compute_psd(fmax=100).plot(picks='eeg', average=False, spatial_colors=True, show=False)
-    
-    # プロットを結果フォルダに画像ファイルとして保存
-    psd_filepath = os.path.join(RESULTS_DIR, f"{base_filename}_psd.png")
-    psd_fig.savefig(psd_filepath)
-    print(f"PSD plot saved to: {psd_filepath}")
-    
-    print("Close the plot window to continue...")
+    if PSD_DB:
+        print("Note: PSD is displayed in dB; negative values are normal.")
+    if SAVE_RAW_PSD:
+        raw_psd_fig = raw_quality.compute_psd(
+            method="welch",
+            fmin=STD_PSD_FMIN,
+            fmax=STD_PSD_FMAX,
+            n_fft=STD_PSD_NFFT,
+            n_overlap=STD_PSD_OVERLAP,
+            average="mean",
+        ).plot(
+            picks='eeg',
+            average=False,
+            spatial_colors=False,
+            dB=PSD_DB,
+            show=False
+        )
+        raw_psd_filepath = os.path.join(RESULTS_DIR, f"{base_filename}_psd_raw.png")
+        raw_psd_fig.savefig(raw_psd_filepath)
+        if len(ch_names) <= 12:
+            ax = raw_psd_fig.axes[0]
+            ax.legend(ch_names, loc="upper right", fontsize="x-small")
+        print(f"Raw PSD plot saved to: {raw_psd_filepath}")
+
+    if SAVE_CLEAN_PSD:
+        clean_psd_fig = raw_psd.compute_psd(
+            method="welch",
+            fmin=STD_PSD_FMIN,
+            fmax=STD_PSD_FMAX,
+            n_fft=STD_PSD_NFFT,
+            n_overlap=STD_PSD_OVERLAP,
+            average="mean",
+        ).plot(
+            picks='eeg',
+            average=False,
+            spatial_colors=False,
+            dB=PSD_DB,
+            show=False
+        )
+        clean_psd_filepath = os.path.join(RESULTS_DIR, f"{base_filename}_psd_clean.png")
+        clean_psd_fig.savefig(clean_psd_filepath)
+        if len(ch_names) <= 12:
+            ax = clean_psd_fig.axes[0]
+            ax.legend(ch_names, loc="upper right", fontsize="x-small")
+        print(f"Clean PSD plot saved to: {clean_psd_filepath}")
+
+    if SAVE_STANDARD_PSD:
+        std_psd = raw_quality.compute_psd(
+            method="welch",
+            fmin=STD_PSD_FMIN,
+            fmax=STD_PSD_FMAX,
+            n_fft=STD_PSD_NFFT,
+            n_overlap=STD_PSD_OVERLAP,
+            average="mean",
+        )
+        std_fig = std_psd.plot(
+            picks="eeg",
+            average=True,
+            spatial_colors=False,
+            dB=True,
+            show=False,
+        )
+        std_filepath = os.path.join(RESULTS_DIR, f"{base_filename}_psd_standard.png")
+        std_fig.savefig(std_filepath)
+        print(f"Standard PSD plot saved to: {std_filepath}")
+
+    print("Close the plot window(s) to continue...")
     plt.show()
 
     # --- 4. 定量的な信号品質評価 ---
     print("\n--- Quantitative Signal Quality Assessment ---")
     
     # 全チャンネルのPSDデータを取得
-    psds, freqs = raw.compute_psd(fmin=1.0, fmax=100.0).get_data(return_freqs=True)
+    psds, freqs = raw_quality.compute_psd(fmin=1.0, fmax=100.0).get_data(return_freqs=True)
     
     # 結果を格納するリスト
     quality_results = []
@@ -169,6 +358,7 @@ def analyze_eeg_data(filepath: str):
 
 if __name__ == "__main__":
     csv_file_path = ""
+    DATA_DIR = "eeg_data"
     # コマンドライン引数でファイルが指定されていれば、それを使用
     if len(sys.argv) > 1:
         csv_file_path = sys.argv[1]
@@ -176,7 +366,9 @@ if __name__ == "__main__":
     else:
         print("No file path provided. Searching for the latest eeg_data_*.csv file...")
         # eeg_data_で始まり.csvで終わるファイルのリストを取得
-        list_of_files = glob.glob('eeg_data_*.csv')
+        search_pattern = os.path.join(DATA_DIR, 'eeg_data_*.csv')
+        list_of_files = glob.glob(search_pattern)
+
         if not list_of_files:
             print("Error: No 'eeg_data_*.csv' files found in the current directory.")
             sys.exit(1)
