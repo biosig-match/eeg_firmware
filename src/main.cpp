@@ -24,7 +24,7 @@ const uint8_t CMD_RREG   = 0x20;
 
 // ========= Stream Parameters =========
 #define SAMPLE_RATE_HZ      250
-#define SAMPLES_PER_CHUNK   25      // 250SPS / 10Hz = 25
+#define SAMPLES_PER_CHUNK   10      // 250SPS / 25Hz = 10
 #define CH_MAX              8       // ADS1299最大8ch
 #define DEVICE_NAME         "ADS1299_EEG_NUS"
 
@@ -80,7 +80,7 @@ bool isStreaming     = false;
 uint8_t  numChannels = 4;  // 起動時に検出
 uint16_t sampleIndexCounter = 0;  // 総サンプル連番（wrap可）
 unsigned long lastBleNotifyTime = 0;
-const unsigned long BLE_NOTIFY_INTERVAL_MS = 100;  // ≒10Hz
+const unsigned long BLE_NOTIFY_INTERVAL_MS = 30;
 
 // バッファ（25サンプル分）
 SampleData sampleBuffer[SAMPLES_PER_CHUNK];
@@ -325,7 +325,7 @@ void loop() {
 
           sampleBufferIndex = 0;
           lastBleNotifyTime = now;
-          delay(10); // BLEスタックが処理する時間を少し与える
+          yield();
         }
       }
     } else {

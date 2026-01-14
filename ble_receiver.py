@@ -5,10 +5,8 @@ Communicates with the NUS-like BLE service defined in main.cpp.
 - Handles two packet types: Device Configuration and Chunked Data.
 - Provides controls to start/stop data streaming.
 - Updates plot labels based on received configuration.
-- Saves all streaming data to a timestamped CSV file.
-- Converts LSB data to microvolts (uV).
-- Displays plots with autorange.
-- Applies a 50Hz notch filter and a 0.5-30Hz bandpass filter.
+- Saves RAW streaming data to a timestamped CSV file (Unfiltered).
+- Displays FILTERED data on plots with autorange.
 """
 
 import sys
@@ -41,28 +39,21 @@ PKT_TYPE_DEVICE_CFG = 0xDD
 
 # ========= Packet Sizes (must match main.cpp) =========
 DEVICE_CONFIG_PACKET_SIZE = 88
-CHUNKED_SAMPLE_PACKET_SIZE = 504
+CHUNKED_SAMPLE_PACKET_SIZE = 204
 
 # Display buffer size (time window) and sampling rate
 BUFFER_SIZE = 750  # 250 SPS * 3 seconds
 SAMPLING_RATE = 250 # Samples per second
 
 # --- ▼▼▼ μV変換のための定数 ▼▼▼ ---
-V_REF = 4.5  # ADS1299のリファレンス電圧 (通常は4.5V)
-# ★★★ ファームウェアでのPGAゲイン設定に合わせてこの値を変更してください ★★★
+V_REF = 4.5  # ADS1299のリファレンス電圧
 PGA_GAIN = 24.0
-# ★★★ 注意: ファームウェアから送られるデータが16ビット整数('<8h..')であるため、
-# 16ビットの分解能で計算します。もしファームウェアが24ビットデータを
-# 送るように変更された場合は、(2**23 - 1) に変更してください。
 LSB_TO_MICROVOLTS = (V_REF / PGA_GAIN / (2**15 - 1)) * 1_000_000
 # --- ▲▲▲ ---
 
 class BLEThread(QThread):
     """
     Handles BLE communication in a separate thread.
-    This class has been refactored to use a more robust asyncio event loop
-    management pattern (`run_forever`) and includes a buffer to handle
-    fragmented BLE packets.
     """
     connection_status = pyqtSignal(str)
     config_received = pyqtSignal(dict)
@@ -75,13 +66,9 @@ class BLEThread(QThread):
         self.loop = None
         self.main_task = None
         self.is_running = False
-        self.rx_buffer = bytearray() # Buffer for fragmented packets
+        self.rx_buffer = bytearray()
 
     def run(self):
-        """
-        Main thread entry point.
-        Initializes and runs the asyncio event loop.
-        """
         self.is_running = True
         try:
             self.loop = asyncio.new_event_loop()
@@ -94,12 +81,9 @@ class BLEThread(QThread):
             self.loop.close()
 
     async def ble_main(self):
-        """Main BLE connection and data reception logic."""
         client = None
         try:
             self.connection_status.emit(f"Scanning for '{DEVICE_NAME}'...")
-
-            # macOS fix: Use discover() instead of find_device_by_name for better reliability
             devices = await BleakScanner.discover(timeout=15.0)
             device = None
             for d in devices:
@@ -112,11 +96,8 @@ class BLEThread(QThread):
                 return
 
             self.connection_status.emit(f"Connecting to {device.name} ({device.address})...")
-
-            # macOS fix: Increase timeout and add connection retry logic
             client = BleakClient(device.address, timeout=30.0)
 
-            # Add retry logic for connection
             max_retries = 3
             for attempt in range(max_retries):
                 try:
@@ -130,10 +111,7 @@ class BLEThread(QThread):
                         raise
 
             self.client = client
-
-            # macOS fix: Add small delay after connection
             await asyncio.sleep(0.5)
-
             self.connection_status.emit(f"Connected to {device.name}.")
 
             self.rx_char = client.services.get_characteristic(CHARACTERISTIC_UUID_RX)
@@ -158,22 +136,16 @@ class BLEThread(QThread):
             self.client = None
             self.rx_char = None
 
-
     def notification_handler(self, sender, data: bytearray):
-        """
-        Callback for incoming BLE notifications.
-        This now buffers and reassembles fragmented packets.
-        """
         if not data:
             return
 
-        print(f"DEBUG: Received {len(data)} bytes from BLE: {data[:20].hex()}...")
-        self.rx_buffer.extend(data) # Add new data to the buffer
+        # print(f"DEBUG: Received {len(data)} bytes") # Debug log reduced
+        self.rx_buffer.extend(data)
 
-        # Process buffer as long as it might contain complete packets
         while True:
             if len(self.rx_buffer) < 1:
-                break # Buffer is empty
+                break
 
             packet_type = self.rx_buffer[0]
             
@@ -183,37 +155,29 @@ class BLEThread(QThread):
             elif packet_type == PKT_TYPE_DATA_CHUNK:
                 expected_len = CHUNKED_SAMPLE_PACKET_SIZE
             else:
-                print(f"Warning: Unknown packet type 0x{packet_type:02X} in buffer. Clearing buffer.")
+                print(f"Warning: Unknown packet type 0x{packet_type:02X}. Clearing buffer.")
                 self.rx_buffer.clear()
                 break
             
-            # Check if we have a full packet in the buffer
             if len(self.rx_buffer) >= expected_len:
-                # Extract the full packet
                 packet_data = self.rx_buffer[:expected_len]
-                # Remove the extracted packet from the buffer
                 self.rx_buffer = self.rx_buffer[expected_len:]
 
-                # Parse the complete packet
                 if packet_type == PKT_TYPE_DEVICE_CFG:
                     self.parse_config_packet(packet_data)
                 elif packet_type == PKT_TYPE_DATA_CHUNK:
                     self.parse_data_chunk_packet(packet_data)
             else:
-                # Not enough data for a full packet, wait for more
                 break
 
-
     def parse_config_packet(self, data: bytearray):
-        """Parses the DeviceConfigPacket (0xDD)."""
         if len(data) < DEVICE_CONFIG_PACKET_SIZE:
-            print(f"Warning: Config packet is too short ({len(data)} bytes)")
             return
         
         _, num_channels = struct.unpack('<BB', data[0:2])
         config = {'num_channels': num_channels, 'electrodes': []}
-        offset = 8 # packet_type(1), num_channels(1), reserved(6)
-        for i in range(8): # CH_MAX is 8
+        offset = 8
+        for i in range(8):
             chunk = data[offset + i*10 : offset + (i+1)*10]
             name_bytes, type_val, _ = struct.unpack('<8sBB', chunk)
             name = name_bytes.partition(b'\0')[0].decode('utf-8', 'ignore')
@@ -223,22 +187,19 @@ class BLEThread(QThread):
         self.config_received.emit(config)
 
     def parse_data_chunk_packet(self, data: bytearray):
-        """Parses the ChunkedSamplePacket (0x66)."""
         if len(data) < 4:
-            print("Warning: Data chunk packet is too short for header.")
             return
         _, start_index, num_samples = struct.unpack('<B H B', data[0:4])
         
-        expected_size = 4 + num_samples * 20 # 20 bytes per SampleData
+        expected_size = 4 + num_samples * 20
         if len(data) != expected_size:
-            print(f"Warning: Data chunk size mismatch. Expected {expected_size}, got {len(data)}.")
+            print(f"Warning: Data chunk size mismatch.")
             return
 
         samples_list = []
         offset = 4
         for i in range(num_samples):
             sample_chunk = data[offset : offset + 20]
-            # '<8hB3x' = 8 signed shorts (16 bytes), 1 unsigned byte, 3 padding bytes
             unpacked_data = struct.unpack('<8hB3x', sample_chunk)
             sample = {
                 'signals': list(unpacked_data[0:8]),
@@ -252,33 +213,24 @@ class BLEThread(QThread):
 
     def _send_command(self, command: bytes):
         if self.client and self.rx_char and self.client.is_connected and self.loop:
-            print(f"DEBUG: Sending command: {command.hex()} to characteristic {self.rx_char.uuid}")
             try:
                 future = asyncio.run_coroutine_threadsafe(
                     self.client.write_gatt_char(self.rx_char, command, response=True),
                     self.loop
                 )
-                # Wait for the write to complete with timeout
                 future.result(timeout=5.0)
-                print(f"DEBUG: Command sent successfully")
-                self.connection_status.emit("Command sent successfully.")
             except Exception as e:
-                print(f"DEBUG: Failed to send command: {e}")
                 self.connection_status.emit(f"Failed to send command: {e}")
         else:
-            print(f"DEBUG: Cannot send - client:{self.client is not None}, rx_char:{self.rx_char is not None}, connected:{self.client.is_connected if self.client else False}, loop:{self.loop is not None}")
             self.connection_status.emit("Not connected, cannot send command.")
 
     def start_streaming(self):
-        print("Sending START_STREAMING command...")
         self._send_command(CMD_START_STREAMING)
 
     def stop_streaming(self):
-        print("Sending STOP_STREAMING command...")
         self._send_command(CMD_STOP_STREAMING)
 
     def stop(self):
-        """Stops the thread by safely stopping the asyncio event loop."""
         self.is_running = False
         if self.loop and self.loop.is_running():
             self.loop.call_soon_threadsafe(self.loop.stop)
@@ -309,33 +261,28 @@ class MainWindow(QMainWindow):
         self.csv_writer = None
         self.csv_header_written = False
 
-        # Timeout timer to check for the first packet after starting stream
         self.first_packet_timer = QTimer(self)
         self.first_packet_timer.setSingleShot(True)
         self.first_packet_timer.timeout.connect(self.check_first_packet_timeout)
         self.first_packet_received = False
         
-        # --- ▼▼▼ フィルタ設計 ▼▼▼ ---
-        self.fs = SAMPLING_RATE  # サンプリング周波数
-
-        # 50Hzノッチフィルタの設計
-        f0_notch = 50.0  # 除去したい周波数 (Hz)
-        Q_notch = 30.0   # クオリティファクタ
+        # --- ▼▼▼ フィルタ設計 (表示用) ▼▼▼ ---
+        self.fs = SAMPLING_RATE
+        # 50Hzノッチ
+        f0_notch = 50.0
+        Q_notch = 30.0
         self.b_notch, self.a_notch = signal.iirnotch(f0_notch, Q_notch, self.fs)
         self.notch_filter_states = [signal.lfilter_zi(self.b_notch, self.a_notch) for _ in range(self.num_channels)]
         
-        # 0.5-30Hz バンドパスフィルタの設計 (2次バターワース)
+        # 0.5-30Hz バンドパス
         nyquist = 0.5 * self.fs
-        low_cutoff = 0.5
-        high_cutoff = 30.0
-        low = low_cutoff / nyquist
-        high = high_cutoff / nyquist
+        low = 0.5 / nyquist
+        high = 30.0 / nyquist
         self.b_band, self.a_band = signal.butter(2, [low, high], btype='band')
         self.bandpass_filter_states = [signal.lfilter_zi(self.b_band, self.a_band) for _ in range(self.num_channels)]
-        # --- ▲▲▲ フィルタ設計ここまで ▲▲▲ ---
+        # --- ▲▲▲ ---
 
     def setup_ui(self):
-        """Set up all UI elements."""
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
@@ -374,16 +321,13 @@ class MainWindow(QMainWindow):
             plot_widget = pg.PlotWidget()
             plot_widget.setLabel('left', f'CH{i+1}', units='μV') 
             plot_widget.setLabel('bottom', 'Samples')
-            # Y軸は固定レンジ，X軸はオートレンジにする
             plot_widget.showGrid(x=True, y=True)
             curve = plot_widget.plot(pen=pg.mkPen(color=(0, 150, 255), width=1))
 
-            # ViewBoxで軸ごとにAutoRangeを制御する（disableAutoRange() は x,y 両方を止めてしまう）
             vb = plot_widget.getPlotItem().getViewBox()
             vb.enableAutoRange(axis=pg.ViewBox.XAxis, enable=True)
             vb.enableAutoRange(axis=pg.ViewBox.YAxis, enable=False)
             plot_widget.setYRange(-200, 200, padding=0)
-
             
             self.plots.append(plot_widget)
             self.curves.append(curve)
@@ -411,10 +355,8 @@ class MainWindow(QMainWindow):
             self.time_buffer.clear()
             self.sample_count = 0
             
-            # --- ▼▼▼ ストリーミング開始時に両方のフィルタ状態をリセット ▼▼▼ ---
             self.notch_filter_states = [signal.lfilter_zi(self.b_notch, self.a_notch) for _ in range(self.num_channels)]
             self.bandpass_filter_states = [signal.lfilter_zi(self.b_band, self.a_band) for _ in range(self.num_channels)]
-            # --- ▲▲▲ ---
             
             save_dir = "eeg_data"
             os.makedirs(save_dir, exist_ok=True)
@@ -434,7 +376,7 @@ class MainWindow(QMainWindow):
             
             self.status_label.setText("Status: Sending start command...")
             self.first_packet_received = False
-            self.first_packet_timer.start(3000) # 3-second timeout
+            self.first_packet_timer.start(3000)
 
             self.ble_thread.start_streaming()
             self.is_streaming = True
@@ -470,7 +412,6 @@ class MainWindow(QMainWindow):
             self.stop_btn.setEnabled(False)
             self.connect_btn.setText("Connect")
 
-
     def on_config_received(self, config: dict):
         self.first_packet_timer.stop()
         if not self.first_packet_received:
@@ -483,6 +424,7 @@ class MainWindow(QMainWindow):
 
         if self.csv_writer and not self.csv_header_written:
             ch_names = [e['name'] if e['name'] else f'CH{i+1}' for i, e in enumerate(electrodes)]
+            # Header name indication: RAW data
             header_ch_names = [f"{name} (uV)" for name in ch_names[:self.num_channels]]
             header = ['timestamp', 'sample_index'] + header_ch_names + ['trigger']
             self.csv_writer.writerow(header)
@@ -498,7 +440,11 @@ class MainWindow(QMainWindow):
                 self.plots[i].setVisible(False)
     
     def on_data_received(self, samples_list: list):
-        """Process a list of incoming samples with cascaded filters."""
+        """
+        Process incoming samples.
+        1. Save RAW data to CSV immediately (Unfiltered).
+        2. Apply filters for Visualization only.
+        """
         if not self.first_packet_received:
             self.first_packet_timer.stop()
             self.first_packet_received = True
@@ -506,56 +452,57 @@ class MainWindow(QMainWindow):
         
         if not samples_list:
             return
+        
+        # CSV書き込み処理 (フィルタ前・参照引き算前の「生データ」) 
+        # ただし、電圧変換(uV)だけは行って保存する
+        if self.csv_writer and self.csv_header_written:
+            for sample in samples_list:
+                timestamp = datetime.now().isoformat()
+                # 元の整数値に係数を掛けてuVに直しただけの値を取得
+                raw_uV = [val * LSB_TO_MICROVOLTS for val in sample['signals'][:self.num_channels]]
+                
+                row = [timestamp, sample['sample_index']] + raw_uV + [sample['trigger']]
+                self.csv_writer.writerow(row)
 
-        # --- ▼▼▼ フィルタリング処理 ▼▼▼ ---
+        last_trigger = 0
+
+        # 画面表示用フィルタリング処理
         # signals_by_channel の形状: (チャンネル数, 受信サンプル数)
         signals_by_channel = np.array([s['signals'] for s in samples_list]).T
+        
+        # フィルタ処理用バッファ
         final_filtered_signals = np.zeros_like(signals_by_channel, dtype=float)
 
-        # 各チャンネルにフィルタをカスケード適用
         for i in range(self.num_channels):
-            # Stage 1: 50Hzノッチフィルタ
+            # 生データにフィルタを適用 (表示用)
             notched_chunk, self.notch_filter_states[i] = signal.lfilter(
                 self.b_notch, self.a_notch, signals_by_channel[i, :], zi=self.notch_filter_states[i]
             )
-            
-            # Stage 2: 0.5-30Hzバンドパスフィルタ
             bandpassed_chunk, self.bandpass_filter_states[i] = signal.lfilter(
                 self.b_band, self.a_band, notched_chunk, zi=self.bandpass_filter_states[i]
             )
-            
             final_filtered_signals[i, :] = bandpassed_chunk
 
-        # CSV保存とプロットのために形状を戻す: (受信サンプル数, チャンネル数)
+        # 転置して (サンプル数, チャンネル数) に戻す
         filtered_samples = final_filtered_signals.T
         
-        # CH1..CH3 から CH4 を差し引く (signals[0..2] -= signals[3])
+        # 参照電極の引き算 (モンタージュ) も表示用のみに適用
+        # CH1..CH3 から CH4 を引く
         if self.num_channels >= 4:
-            ref = filtered_samples[:, 3].copy()          # CH4
+            ref = filtered_samples[:, 3].copy()
             filtered_samples[:, 0:3] = filtered_samples[:, 0:3] - ref[:, None]
 
-        # --- ▲▲▲ フィルタリング処理ここまで ▲▲▲ ---
-
-        last_trigger = 0
-        
-        # CSV書き込み処理 (フィルタ適用後のデータを使用)
-        if self.csv_writer and self.csv_header_written:
-            for idx, sample in enumerate(samples_list):
-                timestamp = datetime.now().isoformat()
-                signals_uV = [val * LSB_TO_MICROVOLTS for val in filtered_samples[idx][:self.num_channels]]
-                row = [timestamp, sample['sample_index']] + signals_uV + [sample['trigger']]
-                self.csv_writer.writerow(row)
-
-        # プロット用バッファの更新 (フィルタ適用後のデータを使用)
+        # === 3. プロット用バッファ更新 (フィルタ済みデータ) ===
         for idx, sample in enumerate(samples_list):
             self.time_buffer.append(self.sample_count)
             self.sample_count += 1
             for i in range(self.num_channels):
+                # フィルタ済みの値をuV変換してプロット
                 value_uV = filtered_samples[idx, i] * LSB_TO_MICROVOLTS
                 self.data_buffers[i].append(value_uV)
             last_trigger = sample['trigger']
         
-        # UI更新
+        # UI更新 (トリガー表示など)
         trigger_bits = format(last_trigger, '04b')
         current_file_text = self.info_label.text().split("|")[-1].strip()
         self.info_label.setText(f"Trigger: {trigger_bits} | {current_file_text}")
@@ -571,12 +518,10 @@ class MainWindow(QMainWindow):
                 self.curves[i].setData(x=time_array, y=np.array(self.data_buffers[i]))
 
     def check_first_packet_timeout(self):
-        """Called by QTimer if no packets are received after starting stream."""
         if self.is_streaming and not self.first_packet_received:
             self.status_label.setText("Status: No response from device. Check firmware/hardware.")
 
     def closeEvent(self, event):
-        """Handle window close event."""
         if self.is_streaming:
             self.stop_streaming()
         if self.ble_thread.isRunning():
@@ -592,4 +537,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
